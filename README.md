@@ -1,6 +1,6 @@
 # Delivery360 Databricks
 
-Proyecto de preparación para el examen **Databricks Data Engineer Associate**. Delivery360 simula la plataforma de una empresa de delivery y construye un flujo completo desde archivos de pedidos hasta un modelo analítico Gold, incorporando ingesta incremental, streaming por micro-lotes, modelo estrella y seguridad a nivel de fila y columna.
+Delivery360 simula la plataforma de una empresa de delivery y construye un flujo completo desde archivos de pedidos hasta un modelo analítico Gold, incorporando ingesta incremental, streaming por micro-lotes, modelo estrella y seguridad a nivel de fila y columna.
 
 ## Problema que resuelve
 
@@ -23,9 +23,9 @@ El conjunto incluye aproximadamente:
 - 100 restaurantes.
 - 300 conductores.
 - 3 lotes de 500 pedidos cada uno.
-- Pagos y eventos de pedido asociados.
+- Pagos y eventos de pedido asociados (no usados para este desarrollo).
 
-La generación introduce algunos valores inválidos de forma intencional —por ejemplo, estados desconocidos, importes negativos y clientes nulos— para demostrar la limpieza en Silver. Los archivos de `payments` y `order_events` se ingieren en Bronze para conservar la fuente completa; el modelo Gold actual se concentra en `orders` y las tablas de referencia.
+La generación introduce algunos valores inválidos de forma intencional; por ejemplo, estados desconocidos, importes negativos y clientes nulos, para demostrar la limpieza en Silver. Los archivos de `payments` y `order_events` se ingieren en Bronze para conservar la fuente completa; el modelo Gold actual se concentra en `orders` y las tablas de referencia.
 
 Las carpetas de datos son:
 
@@ -58,6 +58,22 @@ El Job de datos ejecuta únicamente:
 ```text
 01_simulate_batch -> 02_bronze -> 03_silver -> 04_gold
 ```
+
+### Flujo detallado del Lakeflow Job
+
+El Job se compone de cuatro tareas. `simulate_batch` publica un solo lote por ejecución; las tareas siguientes se ejecutan únicamente cuando termina correctamente su dependencia. Bronze tiene dos reintentos configurados y `simulate_batch` tiene uno.
+
+```mermaid
+flowchart TD
+    S[simulate_batch\nPublica el siguiente lote\nRetries: 1] --> B[bronze\nAuto Loader + availableNow\nRetries: 2]
+    B --> Si[silver\nLimpieza, deduplicación y joins]
+    Si --> G[gold\nFact table, dimensiones y vista]
+    G --> E[Run successful\nEvidencia de corrida completa]
+
+    T[Trigger configurado\nSchedule cada 30 minutos\nActualmente PAUSED] -.-> S
+```
+
+La tarea de gobernanza no forma parte de este DAG. `05_governance` se ejecuta manualmente después de Gold para demostrar el acceso completo, el row filter, las column masks y el rollback sin alterar la corrida principal de datos.
 
 La gobernanza se ejecuta manualmente después de Gold, porque aplica filtros y máscaras sobre tablas que ya deben existir.
 
@@ -107,6 +123,71 @@ Gold implementa un modelo estrella:
 - `dim_date`.
 - `late_delivery_summary`: vista para analizar entregas tardías por región y restaurante.
 
+### Modelo estrella detallado
+
+El grano de `fact_orders` es **una fila por pedido limpio**. Las claves de negocio conectan la tabla de hechos con sus dimensiones:
+
+```mermaid
+erDiagram
+    FACT_ORDERS {
+        string order_id PK
+        string customer_key FK
+        string restaurant_key FK
+        string driver_key FK
+        int date_key FK
+        date order_date
+        string region
+        string order_status
+        decimal order_total
+        int delivery_minutes
+        boolean is_late
+        string source_file
+    }
+
+    DIM_CUSTOMER {
+        string customer_key PK
+        string customer_id
+        string first_name
+        string email
+        string phone
+        string customer_region
+    }
+
+    DIM_RESTAURANT {
+        string restaurant_key PK
+        string restaurant_id
+        string restaurant_name
+        string restaurant_region
+        string category
+    }
+
+    DIM_DRIVER {
+        string driver_key PK
+        string driver_id
+        string driver_email
+        string driver_region
+        decimal base_fee
+    }
+
+    DIM_DATE {
+        int date_key PK
+        date date
+        int year
+        int month
+        string month_name
+        int week_of_year
+        string day_of_week
+        boolean is_weekend
+    }
+
+    DIM_CUSTOMER ||--o{ FACT_ORDERS : customer
+    DIM_RESTAURANT ||--o{ FACT_ORDERS : restaurant
+    DIM_DRIVER ||--o{ FACT_ORDERS : driver
+    DIM_DATE ||--o{ FACT_ORDERS : date
+```
+
+Desde este modelo se puede consultar el valor y la puntualidad de los pedidos por cliente, restaurante, conductor, región o fecha. `late_delivery_summary` es una vista agregada sobre `fact_orders` para responder rápidamente qué restaurantes concentran más pedidos tardíos y qué valor bruto representan.
+
 Las dimensiones utilizan las claves de negocio (`customer_id`, `restaurant_id` y `driver_id`) como claves explicables. `dim_date` usa `date_key` en formato `yyyyMMdd` y agrega atributos de calendario.
 
 El diseño está preparado para declarar restricciones informativas `PRIMARY KEY` y `FOREIGN KEY` antes de la demostración final, recordando que Unity Catalog las trata como restricciones informativas.
@@ -137,15 +218,14 @@ No se eligieron O2, O3, O4, O7, O8, O9 ni O10.
 
 ## Decisiones de diseño
 
-1. **Datos sintéticos deterministas.** Permiten repetir la demo sin depender de una API externa ni exponer PII real.
+1. **Datos sintéticos deterministas.** Permiten repetir la demo sin depender de una API externa.
 2. **Separación entre `seed` e `incoming`.** `seed` representa la fuente preparada; `01_simulate_batch` controla qué lote llega y cuándo, haciendo visible el comportamiento incremental.
 3. **Un esquema por capa.** `bronze`, `silver`, `gold` y `governance` hacen explícita la propiedad y el nivel de transformación de cada objeto.
 4. **Bronze conserva el contrato de entrada.** Se usan esquemas explícitos, metadatos del archivo y checkpoints para demostrar una ingesta confiable sin mezclar reglas de negocio con la captura.
 5. **Silver es la frontera de calidad.** Las reglas de tipos, nulos, estados y duplicados se aplican antes de construir el modelo analítico.
-6. **Claves naturales en Gold.** Evitan complejidad innecesaria para un proyecto educativo y hacen que los joins y la explicación del modelo sean claros.
-7. **`availableNow` en serverless.** Simula micro-lotes de streaming y es compatible con el entorno serverless usado por el proyecto.
-8. **Gobernanza fuera del Job principal.** Se ejecuta después de Gold para poder mostrar el efecto del row filter, column mask y rollback de forma controlada.
-9. **Horario pausado durante el desarrollo.** El Job tiene un horario de 30 minutos, pero permanece pausado hasta que la demo esté lista para evitar ejecuciones inesperadas.
+6. **`availableNow` en serverless.** Simula micro-lotes de streaming y es compatible con el entorno serverless usado por el proyecto.
+7. **Gobernanza fuera del Job principal.** Se ejecuta después de Gold para poder mostrar el efecto del row filter, column mask y rollback de forma controlada.
+8. **Horario pausado durante el desarrollo.** El Job tiene un horario de 30 minutos, pero permanece pausado hasta que la demo esté lista para evitar ejecuciones inesperadas.
 
 ## Cómo se corre
 
